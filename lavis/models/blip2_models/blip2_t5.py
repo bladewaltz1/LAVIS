@@ -61,8 +61,6 @@ class Blip2T5(Blip2Base):
         self.visual_encoder, self.ln_vision = self.init_vision_encoder(
             vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
         )
-        self.visual_encoder = self.visual_encoder.to('cuda:0')
-        self.ln_vision = self.ln_vision.to('cuda:0')
         if freeze_vit:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
@@ -73,8 +71,6 @@ class Blip2T5(Blip2Base):
         self.Qformer, self.query_tokens = self.init_Qformer(
             num_query_token, self.visual_encoder.num_features
         )
-        self.Qformer = self.Qformer.to('cuda:0')
-        self.query_tokens = self.query_tokens.to('cuda:0')
         self.Qformer.cls = None
         self.Qformer.bert.embeddings.word_embeddings = None
         self.Qformer.bert.embeddings.position_embeddings = None
@@ -85,6 +81,8 @@ class Blip2T5(Blip2Base):
         self.t5_tokenizer = T5TokenizerFast.from_pretrained(t5_model)
         t5_config = T5Config.from_pretrained(t5_model)
         t5_config.dense_act_fn = "gelu"
+        t5_config.output_scores = True
+        t5_config.return_dict_in_generate = True
         self.t5_model = T5ForConditionalGeneration.from_pretrained(
             t5_model, config=t5_config
         )
@@ -188,13 +186,23 @@ class Blip2T5(Blip2Base):
             captions (list): A list of strings of length batch_size * num_captions.
         """
         image = samples["image"]
+        attn_mask = samples.get("attn_mask", None)
 
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
+            if attn_mask is not None:
+                masked_image_embeds = self.ln_vision(self.visual_encoder(image, attn_mask))
+
         image_embeds = image_embeds.float()
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
-        )
+        if attn_mask is not None:
+            masked_image_embeds = masked_image_embeds.float()
+
+        if attn_mask is not None:
+            image_atts = attn_mask
+        else:
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
+                image.device
+            )
 
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
         query_output = self.Qformer.bert(
@@ -203,8 +211,17 @@ class Blip2T5(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
+        if attn_mask is not None:
+            masked_query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=masked_image_embeds,
+                encoder_attention_mask=image_atts,
+                return_dict=True,
+            )
 
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+        if attn_mask is not None:
+            masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
         if "prompt" in samples.keys():
@@ -223,10 +240,14 @@ class Blip2T5(Blip2Base):
             prompt, padding="longest", return_tensors="pt"
         ).to(image.device)
 
+        if attn_mask is not None:
+            atts_t5 = torch.cat([atts_t5, atts_t5], dim=1)
         encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1)
 
         with self.maybe_autocast(dtype=torch.bfloat16):
             inputs_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
+            if attn_mask is not None:
+                inputs_t5 = torch.cat([masked_inputs_t5, masked_inputs_t5], dim=1)
             inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
 
             outputs = self.t5_model.generate(
@@ -243,7 +264,7 @@ class Blip2T5(Blip2Base):
                 num_return_sequences=num_captions,
             )
             output_text = self.t5_tokenizer.batch_decode(
-                outputs, skip_special_tokens=True
+                outputs['sequences'], skip_special_tokens=True
             )
 
         return output_text

@@ -174,12 +174,14 @@ class BlipImageEvalProcessor(BlipImageBaseProcessor):
                     (image_size, image_size), interpolation=InterpolationMode.BICUBIC
                 ),
                 transforms.ToTensor(),
-                self.normalize,
             ]
         )
 
-    def __call__(self, item):
-        return self.transform(item)
+    def __call__(self, item, normalize=True):
+        item = self.transform(item)
+        if normalize:
+            item = self.normalize(item)
+        return item
 
     @classmethod
     def from_config(cls, cfg=None):

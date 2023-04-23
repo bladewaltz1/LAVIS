@@ -115,7 +115,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(all_head_dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, rel_pos_bias=None):
+    def forward(self, x, rel_pos_bias=None, attn_mask=None):
         B, N, C = x.shape
         qkv_bias = None
         if self.q_bias is not None:
@@ -138,7 +138,10 @@ class Attention(nn.Module):
 
         if rel_pos_bias is not None:
             attn = attn + rel_pos_bias
-        
+
+        if attn_mask is not None:
+            attn = attn + (1 - attn_mask.unsqueeze(dim=1).unsqueeze(dim=1)) * -10000.0
+
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -170,12 +173,12 @@ class Block(nn.Module):
         else:
             self.gamma_1, self.gamma_2 = None, None
 
-    def forward(self, x, rel_pos_bias=None):
+    def forward(self, x, rel_pos_bias=None, attn_mask=None):
         if self.gamma_1 is None:
-            x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
+            x = x + self.drop_path(self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias, attn_mask=attn_mask))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
         else:
-            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias))
+            x = x + self.drop_path(self.gamma_1 * self.attn(self.norm1(x), rel_pos_bias=rel_pos_bias, attn_mask=attn_mask))
             x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         return x
 
@@ -321,7 +324,7 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
+    def forward_features(self, x, attn_mask=None):
         x = self.patch_embed(x)
         batch_size, seq_len, _ = x.size()
 
@@ -334,9 +337,9 @@ class VisionTransformer(nn.Module):
         rel_pos_bias = self.rel_pos_bias() if self.rel_pos_bias is not None else None
         for blk in self.blocks:
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, rel_pos_bias)
+                x = checkpoint.checkpoint(blk, x, rel_pos_bias, attn_mask)
             else:
-                x = blk(x, rel_pos_bias)
+                x = blk(x, rel_pos_bias, attn_mask)
         return x
 #         x = self.norm(x)
 
@@ -346,8 +349,8 @@ class VisionTransformer(nn.Module):
 #         else:
 #             return x[:, 0]
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, x, attn_mask=None):
+        x = self.forward_features(x, attn_mask)
 #         x = self.head(x)
         return x
 
