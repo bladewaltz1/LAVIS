@@ -106,8 +106,9 @@ class Blip2T5(Blip2Base):
 
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
-        image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-            image.device
+        image_atts = samples.get(
+            "attn_mask", 
+            torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
         )
 
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -186,24 +187,14 @@ class Blip2T5(Blip2Base):
             captions (list): A list of strings of length batch_size * num_captions.
         """
         image = samples["image"]
-        attn_mask = samples.get("attn_mask", None)
 
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
-            if attn_mask is not None:
-                masked_image_embeds = self.ln_vision(self.visual_encoder(image, attn_mask))
-
         image_embeds = image_embeds.float()
-        if attn_mask is not None:
-            masked_image_embeds = masked_image_embeds.float()
-
-        if attn_mask is not None:
-            image_atts = attn_mask
-        else:
-            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(
-                image.device
-            )
-
+        image_atts = samples.get(
+            "attn_mask", 
+            torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+        )
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
@@ -211,17 +202,8 @@ class Blip2T5(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
-        if attn_mask is not None:
-            masked_query_output = self.Qformer.bert(
-                query_embeds=query_tokens,
-                encoder_hidden_states=masked_image_embeds,
-                encoder_attention_mask=image_atts,
-                return_dict=True,
-            )
 
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
-        if attn_mask is not None:
-            masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
         if "prompt" in samples.keys():
@@ -240,14 +222,10 @@ class Blip2T5(Blip2Base):
             prompt, padding="longest", return_tensors="pt"
         ).to(image.device)
 
-        if attn_mask is not None:
-            atts_t5 = torch.cat([atts_t5, atts_t5], dim=1)
         encoder_atts = torch.cat([atts_t5, input_tokens.attention_mask], dim=1)
 
         with self.maybe_autocast(dtype=torch.bfloat16):
             inputs_embeds = self.t5_model.encoder.embed_tokens(input_tokens.input_ids)
-            if attn_mask is not None:
-                inputs_t5 = torch.cat([masked_inputs_t5, masked_inputs_t5], dim=1)
             inputs_embeds = torch.cat([inputs_t5, inputs_embeds], dim=1)
 
             outputs = self.t5_model.generate(
@@ -267,7 +245,7 @@ class Blip2T5(Blip2Base):
                 outputs['sequences'], skip_special_tokens=True
             )
 
-        return output_text
+        return output_text, outputs['sequences_scores']
 
     def predict_answers(
         self,
