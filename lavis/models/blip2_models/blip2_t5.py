@@ -101,13 +101,15 @@ class Blip2T5(Blip2Base):
         self._apply_lemmatizer = apply_lemmatizer
         self._lemmatizer = None
 
-    def forward(self, samples):
+    def forward(self, samples, alpha=0.5):
         image = samples["image"]
 
+        vit_mask = samples.get("patch_attn_mask", None)
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
+            masked_image_embds = self.ln_vision(self.visual_encoder(image, vit_mask))
         image_atts = samples.get(
-            "attn_mask", 
+            "patch_attn_mask", 
             torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
         )
 
@@ -118,8 +120,16 @@ class Blip2T5(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
+        masked_query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=masked_image_embds,
+            encoder_attention_mask=image_atts,
+            return_dict=True,
+        )
 
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+        masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
+        inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
         with self.maybe_autocast(dtype=torch.bfloat16):
@@ -171,6 +181,7 @@ class Blip2T5(Blip2Base):
         length_penalty=1.0,
         num_captions=1,
         temperature=1,
+        alpha=0.5
     ):
         """
         Args:
@@ -188,11 +199,14 @@ class Blip2T5(Blip2Base):
         """
         image = samples["image"]
 
+        vit_mask = samples.get("patch_attn_mask", None)
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
+            masked_image_embeds = self.ln_vision(self.visual_encoder(image, vit_mask))
         image_embeds = image_embeds.float()
+        masked_image_embeds = masked_image_embeds.float()
         image_atts = samples.get(
-            "attn_mask", 
+            "patch_attn_mask", 
             torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
         )
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -202,8 +216,17 @@ class Blip2T5(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
+        masked_query_output = self.Qformer.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=masked_image_embeds,
+            encoder_attention_mask=image_atts,
+            return_dict=True,
+        )
 
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
+        masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
+        # TODO: add image feature?
+        inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
         if "prompt" in samples.keys():
