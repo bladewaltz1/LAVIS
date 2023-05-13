@@ -5,6 +5,7 @@
  For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 """
 import logging
+import math
 
 import torch
 import torch.nn as nn
@@ -103,16 +104,21 @@ class Blip2T5(Blip2Base):
 
     def forward(self, samples, alpha=0.5):
         image = samples["image"]
+        focal_patch_mask = samples.get("focal_patch_mask", None)
+        focal_image = samples.get("focal_image", None)
+        use_focal = focal_image is not None and focal_patch_mask is not None
 
-        vit_mask = samples.get("patch_attn_mask", None)
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
-            masked_image_embds = self.ln_vision(self.visual_encoder(image, vit_mask))
+            if use_focal:
+                masked_image_embeds = self.ln_vision(
+                    self.visual_encoder(focal_image, focal_patch_mask)
+                )
+
         image_atts = samples.get(
-            "patch_attn_mask", 
+            "patch_mask", 
             torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
         )
-
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
         query_output = self.Qformer.bert(
             query_embeds=query_tokens,
@@ -120,16 +126,20 @@ class Blip2T5(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
-        masked_query_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=masked_image_embds,
-            encoder_attention_mask=image_atts,
-            return_dict=True,
-        )
+
+        if use_focal:
+            masked_query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=masked_image_embeds,
+                encoder_attention_mask=focal_patch_mask,
+                return_dict=True,
+            )
 
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
-        masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
-        inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
+        if use_focal:
+            masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
+            inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
+
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
         with self.maybe_autocast(dtype=torch.bfloat16):
@@ -198,15 +208,23 @@ class Blip2T5(Blip2Base):
             captions (list): A list of strings of length batch_size * num_captions.
         """
         image = samples["image"]
+        focal_patch_mask = samples.get("focal_patch_mask", None)
+        focal_image = samples.get("focal_image", None)
+        use_focal = focal_image is not None and focal_patch_mask is not None
 
-        vit_mask = samples.get("patch_attn_mask", None)
         with self.maybe_autocast():
             image_embeds = self.ln_vision(self.visual_encoder(image))
-            masked_image_embeds = self.ln_vision(self.visual_encoder(image, vit_mask))
+            if use_focal:
+                masked_image_embeds = self.ln_vision(
+                    self.visual_encoder(focal_image, focal_patch_mask)
+                )
+
         image_embeds = image_embeds.float()
-        masked_image_embeds = masked_image_embeds.float()
+        if use_focal:
+            masked_image_embeds = masked_image_embeds.float()
+
         image_atts = samples.get(
-            "patch_attn_mask", 
+            "patch_mask", 
             torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
         )
         query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
@@ -216,17 +234,27 @@ class Blip2T5(Blip2Base):
             encoder_attention_mask=image_atts,
             return_dict=True,
         )
-        masked_query_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=masked_image_embeds,
-            encoder_attention_mask=image_atts,
-            return_dict=True,
-        )
+
+        if use_focal:
+            masked_query_output = self.Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=masked_image_embeds,
+                encoder_attention_mask=focal_patch_mask,
+                return_dict=True,
+            )
 
         inputs_t5 = self.t5_proj(query_output.last_hidden_state)
-        masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
-        # TODO: add image feature?
-        inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
+        if use_focal:
+            masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
+
+            attn = torch.einsum("ijk,ilk->ijl", masked_inputs_t5, inputs_t5)
+            attn = attn / math.sqrt(masked_inputs_t5.shape[-1])
+            attn = torch.softmax(attn, dim=-1)
+            attn_inputs_t5 = torch.bmm(attn, inputs_t5)
+            inputs_t5 = attn_inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
+
+            # inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
+
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
 
         if "prompt" in samples.keys():
