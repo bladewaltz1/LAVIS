@@ -249,63 +249,21 @@ class Blip2T5(Blip2Base):
         if use_focal:
             masked_inputs_t5 = self.t5_proj(masked_query_output.last_hidden_state)
 
-            # TODO: compare different fusion methods
-            # # setting 1
-            # inputs_t5 = inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
-
-            # # setting 2
-            # attn = torch.einsum("ijk,ilk->ijl", masked_inputs_t5, inputs_t5)
-            # attn = attn / math.sqrt(masked_inputs_t5.shape[-1])
-            # attn = torch.softmax(attn, dim=-1)
-            # attn_inputs_t5 = torch.bmm(attn, inputs_t5)
-            # inputs_t5 = attn_inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
-
-            # # setting 3
-            # distance = ((masked_inputs_t5.transpose(0, 1) - inputs_t5) ** 2).mean(dim=-1)
-            # attn = distance.mean() / (distance + 1e-10)
-            # attn = torch.softmax(attn.unsqueeze(0), dim=-1)
-            # attn_inputs_t5 = torch.bmm(attn, inputs_t5)
-            # inputs_t5 = attn_inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
-
-            # # setting 4
-            # _, nq, _ = masked_inputs_t5.shape
-            # distance = ((masked_inputs_t5.transpose(0, 1) - inputs_t5) ** 2)
-            # distance = distance.view(nq, nq, self.t5_model.config.num_heads, -1).mean(dim=-1)
-            # attn = distance.mean() / (distance + 1e-10)
-            # attn = torch.softmax(attn.permute(2, 0, 1), dim=-1)
-            # inputs_t5 = inputs_t5.reshape(nq, self.t5_model.config.num_heads, -1)
-            # inputs_t5 = inputs_t5.permute(1, 0, 2)
-            # attn_inputs_t5 = torch.bmm(attn, inputs_t5)
-            # attn_inputs_t5 = attn_inputs_t5.permute(1, 0, 2).reshape(1, nq, -1)
-            # inputs_t5 = attn_inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
-
-            # # setting 5
-            # distance = ((inputs_t5.transpose(0, 1) - masked_inputs_t5) ** 2)
-            # distance = distance.view(nq, nq, self.t5_model.config.num_heads, -1).mean(dim=-1)
-            # attn = distance.mean() / (distance + 1e-10)
-            # attn = torch.softmax(attn.permute(2, 0, 1), dim=-1)
-            # masked_inputs_t5 = masked_inputs_t5.reshape(nq, self.t5_model.config.num_heads, -1)
-            # masked_inputs_t5 = masked_inputs_t5.permute(1, 0, 2)
-            # attn_inputs_t5 = torch.bmm(attn, masked_inputs_t5)
-            # attn_inputs_t5 = attn_inputs_t5.permute(1, 0, 2).reshape(1, nq, -1)
-            # inputs_t5 = attn_inputs_t5 * alpha + inputs_t5 * (1 - alpha)
-
-            bs, nq, _ = masked_inputs_t5.shape
-            inputs_t5 = inputs_t5.reshape(bs, nq, self.t5_model.config.num_heads, -1)
-            masked_inputs_t5 = masked_inputs_t5.reshape(bs, nq, self.t5_model.config.num_heads, -1)
-            inner_prod = torch.einsum("ijkd,ilkd->ikjl", masked_inputs_t5, inputs_t5)
-            inner_prod = inner_prod / math.sqrt(masked_inputs_t5.shape[-1])
+            _, nq, _ = masked_inputs_t5.shape
+            inputs_t5 = inputs_t5.reshape(1, nq, self.t5_model.config.num_heads, -1)
+            masked_inputs_t5 = masked_inputs_t5.reshape(1, nq, self.t5_model.config.num_heads, -1)
+            attn = torch.einsum("ijkd,ilkd->ikjl", masked_inputs_t5, inputs_t5)
+            attn = attn / 256.0
 
             mode = samples.get("mode", "foreground")
-
             if mode == "foreground":
-                attn1 = inner_prod.softmax(dim=3)
-                attn1_inputs_t5 = torch.einsum("ikjl,ilkd->ijkd", attn1, inputs_t5)
-                inputs_t5 = attn1_inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
+                attn = attn.softmax(dim=3)
+                attn_inputs_t5 = torch.einsum("ikjl,ilkd->ijkd", attn, inputs_t5)
+                inputs_t5 = attn_inputs_t5 * alpha + masked_inputs_t5 * (1 - alpha)
             elif mode == "background":
-                attn2 = inner_prod.softmax(dim=2)
-                attn2_inputs_t5 = torch.einsum("ikjl,ijkd->ilkd", attn2, masked_inputs_t5)
-                inputs_t5 = attn2_inputs_t5 * alpha + inputs_t5 * (1 - alpha)
+                attn = attn.softmax(dim=2)
+                attn_inputs_t5 = torch.einsum("ikjl,ijkd->ilkd", attn, masked_inputs_t5)
+                inputs_t5 = attn_inputs_t5 * alpha + inputs_t5 * (1 - alpha)
             inputs_t5 = inputs_t5.flatten(2, 3)
 
         atts_t5 = torch.ones(inputs_t5.size()[:-1], dtype=torch.long).to(image.device)
